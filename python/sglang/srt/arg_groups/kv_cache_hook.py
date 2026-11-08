@@ -648,6 +648,16 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "pool, and would pack an MTP head's KV into the target's "
         "page-envelope host pool, which refuses per-layer draft loads."
     )
+    assert not (
+        cfg.pp_size > 1
+        and cfg.enable_hierarchical_cache
+        and cfg.hicache_host_memory_mode == "buffer_only"
+    ), (
+        "--enable-unified-memory with --pp-size > 1 does not support "
+        "--hicache-host-memory-mode buffer_only: each pipeline stage drains its "
+        "own backup completions, so the stages' eviction credit, and with it "
+        "their capacity decisions, can differ."
+    )
     if cfg.dcp_size > 1:
         _validate_unified_memory_dcp(server_args)
     # Prefill cuda-graph capture IS wired for the unified pool: the captured
