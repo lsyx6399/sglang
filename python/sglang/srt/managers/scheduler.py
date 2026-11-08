@@ -4418,6 +4418,17 @@ class Scheduler(
             f"picked-rids={picked_rids}{more}"
         )
 
+    def _drop_unadmitted_match(self, req: Req) -> None:
+        """Undo what the prefix match staged for a request this pass does not admit."""
+        # init_next_round_input() may stage deferred Mamba COW/clear metadata,
+        # and take a state slot a session does not own.
+        req.kv.mamba_cow_src_index = None
+        req.kv.mamba_needs_clear = False
+        if req.kv.holds_mamba and req.session is None:
+            kv_storage_of(
+                self.req_to_token_pool, self.token_to_kv_pool_allocator
+            ).release_state_slot(req)
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -4607,11 +4618,8 @@ class Scheduler(
             ):
                 running_batch.batch_is_full = True
 
-            if running_batch.batch_is_full:
-                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req
-                ):
-                    break
+            if running_batch.batch_is_full and not self.enable_priority_preemption:
+                break
 
             if (
                 self.enable_hicache_storage
@@ -4637,18 +4645,35 @@ class Scheduler(
                     # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
 
-            req.init_next_round_input(self.tree_cache)
+            # Preemption prices this match before it frees anything, so the
+            # match takes no state slot; the slot is bound with the row. The
+            # group's unused slots go back first, so the price sees them free.
+            defer_cow_slot = running_batch.batch_is_full
+            if defer_cow_slot and mamba_allocator is not None:
+                mamba_allocator.alloc_group_end()
+            req.init_next_round_input(self.tree_cache, defer_cow_slot=defer_cow_slot)
             if adder.should_defer(req):
+                self._drop_unadmitted_match(req)
                 break
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
             ):
+                self._drop_unadmitted_match(req)
                 continue
             if self.enable_hicache_storage and buffer_pipeline is not None:
                 staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
                 req.time_stats.observe_storage_staging_ready(staging_ready)
                 if not staging_ready:
+                    self._drop_unadmitted_match(req)
                     continue
+            # Priced on the match just refreshed, as admission prices it.
+            if running_batch.batch_is_full and not adder.preempt_to_schedule(
+                req,
+                has_chunked_req=(self.chunked_req is not None),
+                truncation_align_size=self.truncation_align_size,
+            ):
+                self._drop_unadmitted_match(req)
+                break
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
@@ -4669,14 +4694,7 @@ class Scheduler(
                 # lifecycle and freeing them here causes double-free.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
-                    # init_next_round_input() may stage deferred Mamba COW/clear
-                    # metadata before add_one_req() rejects the request.
-                    req.kv.mamba_cow_src_index = None
-                    req.kv.mamba_needs_clear = False
-                    if req.kv.holds_mamba and not getattr(req, "session", None):
-                        kv_storage_of(
-                            self.req_to_token_pool, self.token_to_kv_pool_allocator
-                        ).release_state_slot(req)
+                    self._drop_unadmitted_match(req)
                 if res == AddReqResult.UNSCHEDULABLE and not added:
                     # Nothing holding memory will give it back: waiting would
                     # keep the request queued forever.

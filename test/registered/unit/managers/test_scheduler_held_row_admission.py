@@ -31,7 +31,7 @@ class _Req:
         self.beam_group = None
         self.token_indices_to_pool = None
 
-    def init_next_round_input(self, tree_cache=None):
+    def init_next_round_input(self, tree_cache=None, **_):
         pass
 
 

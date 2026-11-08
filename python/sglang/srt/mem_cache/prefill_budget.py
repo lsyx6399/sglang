@@ -19,8 +19,9 @@ Selection checks do not mutate cache state. Shared-pool load preparation
 realizes the selected reservation before a host transfer pins device rows.
 """
 
-from contextlib import nullcontext
-from typing import Dict, Mapping, Optional
+from contextlib import contextmanager, nullcontext
+from itertools import accumulate
+from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import (
@@ -32,6 +33,7 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import evictable_by_sub_pool
 from sglang.srt.mem_cache.capacity import reclaim_for_load_back
+from sglang.srt.mem_cache.common import release_plan
 from sglang.srt.mem_cache.kv.alloc.demand import (
     DemandPurpose,
     KVDemand,
@@ -87,6 +89,9 @@ def _single_window_hit(
 class PrefillBudget:
     """Fixed token pool. Offsets include pending allocations and decode headroom."""
 
+    # The requests a preemption being priced retracts (`preemptions_needed`).
+    released_reqs: Sequence = ()
+
     # When False, admission skips the FULL spec and passes the host hit length.
     load_back_needs_full_tokens = False
     # FULL-token conversion for fixed/split policies; joint admission preserves
@@ -100,6 +105,9 @@ class PrefillBudget:
     # Set when `check_prefill` refuses a request no wait can admit;
     # the scheduler aborts it instead of keeping it queued.
     unschedulable = False
+    # Admission prices each demand on the allocator rather than against a
+    # remaining token count, so the budget has no `remaining_total`.
+    prices_by_demand = False
 
     def __init__(self, allocator, tree_cache, *, num_mixed_decode_tokens: int = 0):
         self.allocator = allocator
@@ -213,6 +221,47 @@ class PrefillBudget:
         return paged_input + state_slots * self.state_slot_cost <= min(
             self.remaining_current, self.remaining_total
         )
+
+    def ignore_eos_decode_fits(
+        self,
+        req_states: Sequence[Tuple[float, int]],
+        *,
+        paged_input: int,
+        reserve_tokens: int,
+        **request,
+    ) -> bool:
+        """Whether admitting ``paged_input`` rows lets every running request decode
+        to its end, fewest-left first (``req_states``), plus ``reserve_tokens`` each."""
+        cur_rem_tokens = self.remaining_current - paged_input
+        tokens_freed = 0
+        for i, (tokens_left, tokens_occupied) in enumerate(req_states):
+            # tokens_left gives a reservative calculation as the last token is not stored
+            bs = len(req_states) - i
+            min_free_tokens = cur_rem_tokens + tokens_freed - tokens_left * bs
+            # reserve tokens for corner cases
+            if min_free_tokens <= reserve_tokens * bs:
+                return False
+            tokens_freed += tokens_occupied
+        return True
+
+    def preemptions_needed(
+        self,
+        candidates: Sequence,
+        released_tokens: Sequence[float],
+        *,
+        total_tokens: int,
+        admits: Callable[[], bool],
+    ) -> Optional[int]:
+        """How many of ``candidates`` (in order, each giving back ``released_tokens``)
+        to preempt, at least one, before the request fits; None if none suffice.
+        A fixed pool counts its ``total_tokens``; ``admits`` is for a budget that
+        asks admission itself."""
+        min_tokens_to_remove = total_tokens - self.remaining_total
+        for count, tokens in enumerate(released_tokens, 1):
+            min_tokens_to_remove -= tokens
+            if min_tokens_to_remove <= 0:
+                return count
+        return None
 
     def available_chunk_tokens(self, chunk_limit: int) -> int | None:
         available_tokens = int(self.remaining_total)
@@ -506,6 +555,7 @@ class ChainPrefillBudget(PrefillBudget):
     load_back_needs_full_tokens = True
     requires_final_shape_check = True
     admits_whole_requests = True
+    prices_by_demand = True
 
     def __init__(self, allocator, tree_cache, *, num_mixed_decode_tokens: int = 0):
         super().__init__(
@@ -531,14 +581,18 @@ class ChainPrefillBudget(PrefillBudget):
         # The rows this pass's forward writes, without the commitments and
         # decode that come later (`current_offset` is the token sub-pool's).
         self.window_current_offsets = dict(self.window_offsets)
+        # Units by sub-pool a preemption being priced frees, and the requests
+        # it retracts (`_released`).
+        self._released_units: Mapping[str, int] = {}
+        self.released_reqs: Sequence = ()
 
     def _available_and_evictable(self):
-        # The scalar budget counts owner (FULL) tokens: admission prices every
-        # sub-pool itself, and `available_size` understates small-window needs.
-        available = self.allocator.full_available_size()
-        if is_cp_sharded_padded():
-            available = from_cp_sharded(available)
-        return available + self.tree_cache.full_evictable_size()
+        # Sub-pools share bytes, so no token count says whether a demand fits;
+        # every question this budget answers prices a demand (`_fits`).
+        raise TypeError(
+            "a budget over a shared memory has no remaining token count; ask "
+            "it whether a demand fits"
+        )
 
     def request_demand(
         self,
@@ -610,7 +664,11 @@ class ChainPrefillBudget(PrefillBudget):
         asked of memory, since the running batch misses PD sends and microbatches."""
         from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 
-        return kv_storage_of(None, self.allocator).others_hold_rows(req)
+        # A retracted request's row is freed or parked: it holds none after.
+        releasing = sum(r.kv.req_pool_idx is not None for r in self.released_reqs)
+        return kv_storage_of(None, self.allocator).others_hold_rows(
+            req, releasing=releasing
+        )
 
     def _waiting_frees_memory(self) -> bool:
         """Whether memory comes back to a request that waits: admitted work, a
@@ -634,7 +692,13 @@ class ChainPrefillBudget(PrefillBudget):
         return {name: 0 for name, _ in self.windows}
 
     def _fits(
-        self, full_tokens, window_tokens, state_slots=0, *, empty_pool=False, now=False
+        self,
+        full_tokens,
+        window_tokens,
+        state_slots=0,
+        *,
+        empty_pool=False,
+        now=False,
     ):
         """Whether the pending work plus this demand is admitted (the demand alone
         with ``empty_pool``); with ``now``, pending is only this pass's forward rows."""
@@ -658,15 +722,13 @@ class ChainPrefillBudget(PrefillBudget):
             state_slots + state_pending,
         )
 
-        return self.allocator.admits(
-            demand,
-            evictable=(
-                None
-                if empty_pool
-                else evictable_by_sub_pool(self.tree_cache, self.allocator)
-            ),
-            empty_pool=empty_pool,
-        )
+        evictable = None
+        if not empty_pool:
+            evictable = evictable_by_sub_pool(self.tree_cache, self.allocator)
+            # What a preemption being priced frees goes back as eviction would.
+            for name, units in self._released_units.items():
+                evictable[name] = evictable.get(name, 0) + units
+        return self.allocator.admits(demand, evictable=evictable, empty_pool=empty_pool)
 
     def _admits(self, demand: KVDemand, **kwargs) -> bool:
         return self._fits(
@@ -675,16 +737,125 @@ class ChainPrefillBudget(PrefillBudget):
 
     @property
     def remaining_window_tokens(self):
-        # Token view for paths that size work by a token count (dLLM): the
-        # fewest tokens any window can still take, less what is pending on it.
-        if not self.windows:
-            return 0
-        return min(
-            self.allocator.window_available_size(name)
-            + self.tree_cache.window_evictable_size(name)
-            - self.window_offsets[name]
-            for name, _ in self.windows
+        return self._available_and_evictable()
+
+    def largest_chunk_tokens(
+        self, max_tokens: int, *, now: bool = False, granule: int = 1
+    ) -> int:
+        """The most tokens, up to ``max_tokens`` and on ``granule``, a chunk with no
+        cached prefix or decode can run beside pending work (and this pass's
+        writes, with ``now``)."""
+        return self._chunk_cap(
+            max_chunk_tokens=max_tokens,
+            chunk_limit=None,
+            host_hit_lengths=None,
+            state_slots=0,
+            now=now,
+            granule=granule,
         )
+
+    def largest_block_tokens(
+        self,
+        max_tokens: int,
+        *,
+        prefix_tokens: int,
+        extra_tokens: int = 0,
+        now: bool = False,
+        granule: int = 1,
+    ) -> int:
+        """The most tokens, up to ``max_tokens`` and on ``granule``, a block that
+        extends ``prefix_tokens`` held rows can run beside pending work (and
+        this pass's writes, with ``now``): it takes exactly the pages past those
+        the prefix fills, in the token sub-pool and every window."""
+        page = self.page_size
+
+        def fits(tokens):
+            pages_end = -(-(prefix_tokens + tokens) // page) * page
+            rows = pages_end - -(-prefix_tokens // page) * page + extra_tokens
+            return self._admits(KVDemand.same_tokens(self.allocator, rows), now=now)
+
+        return largest_fitting_chunk(fits, max_tokens, granule)
+
+    def ignore_eos_decode_fits(
+        self,
+        req_states: Sequence[Tuple[float, int]],
+        *,
+        paged_input: int,
+        reserve_tokens: int,
+        extend_input_len: int,
+        max_new_tokens: int,
+        chunk_limit: Optional[int],
+        state_slots: int,
+        cached_tokens: int,
+    ) -> bool:
+        """The static rule's staged finish as one demand: the worst stage's token rows
+        beside the prompt rows, windows and state slots (admission is monotone)."""
+        peak = 0
+        tokens_freed = 0
+        for i, (tokens_left, tokens_occupied) in enumerate(req_states):
+            bs = len(req_states) - i
+            peak = max(peak, (tokens_left + reserve_tokens) * bs - tokens_freed)
+            tokens_freed += tokens_occupied
+        request = self.request_demand(
+            extend_input_len,
+            max_new_tokens,
+            chunk_limit=chunk_limit,
+            state_slots=state_slots,
+            cached_tokens=cached_tokens,
+        )
+        return self._fits(
+            paged_input + peak, request.window_tokens, request.state_slots, now=True
+        )
+
+    def preemptions_needed(
+        self,
+        candidates: Sequence,
+        released_tokens: Sequence[float],
+        *,
+        total_tokens: int,
+        admits: Callable[[], bool],
+    ) -> Optional[int]:
+        """How many of ``candidates`` (in order) to preempt, at least one, before
+        ``admits()``, admission's own question for the request, holds once their
+        pending decode (``released_tokens``) is cancelled and what retracting them
+        frees (`release_plan`) goes back; surplus bytes serve any sub-pool."""
+        if not candidates:
+            return None
+        cancelled = list(accumulate(released_tokens, initial=0.0))
+        freed = [{}]
+        for req in candidates:
+            units = dict(freed[-1])
+            for name, count in release_plan(req, self.tree_cache).items():
+                units[name] = units.get(name, 0) + count
+            freed.append(units)
+
+        def fits(count):
+            with self._released(cancelled[count], freed[count], candidates[:count]):
+                return admits()
+
+        low, high = 1, len(candidates)
+        if not fits(high):
+            return None
+        while low < high:
+            mid = (low + high) // 2
+            if fits(mid):
+                high = mid
+            else:
+                low = mid + 1
+        return low
+
+    @contextmanager
+    def _released(self, decode_tokens: float, units: Mapping[str, int], reqs: Sequence):
+        """Price as if a preemption had retracted ``reqs``: cancelled
+        ``decode_tokens`` of pending decode and freed ``units`` by sub-pool."""
+        saved = self.total_offset, self._released_units, self.released_reqs
+        self.total_offset -= decode_tokens
+        self._released_units = units
+        self.released_reqs = reqs
+        try:
+            yield
+        finally:
+            self.total_offset, self._released_units, self.released_reqs = saved
 
     def has_capacity(self) -> bool:
         return self._fits(0, self._no_window_tokens())

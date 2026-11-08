@@ -146,3 +146,38 @@ def test_mamba_publication_snapshots_component_cursors(cache_class, swa_enabled)
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.parametrize("swa_enabled", [False, True])
+def test_external_slots_on_a_shared_memory_reclaim_the_load_demand(
+    cache_class, swa_enabled
+):
+    """Regression: on sub-pools sharing one memory, an external load compared an
+    availability estimate before it took its rows, and so evicted for room the
+    layout could not make, or skipped eviction the take needed."""
+    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+
+    cache, _, _ = _cache_and_request(cache_class, swa_enabled=swa_enabled)
+    cache.supports_prefix_sharing = lambda: True
+    cache.evict_for_alloc = mock.Mock()
+    allocator = mock.Mock(pools_share_memory=True, hands_out_virtual_ids=True)
+    allocator.prealloc_shortfall.return_value = None
+    estimate = mock.Mock(side_effect=AssertionError("read an estimate"))
+    allocator.available_size = estimate
+    allocator.full_attn_allocator.available_size = estimate
+    allocator.swa_attn_allocator.available_size = estimate
+    taken = torch.arange(8)
+    allocator.alloc.return_value = taken
+    allocator.full_attn_allocator.alloc.return_value = taken
+    cache.token_to_kv_pool_allocator = allocator
+
+    with (
+        mock.patch.object(cache_class, "sliding_window_size", 4),
+        mock.patch.object(cache_class, "page_size", 1),
+    ):
+        assert cache._allocate_external_slots(8) is taken
+
+    window = {FIRST: 4} if swa_enabled else {}
+    cache.evict_for_alloc.assert_called_once_with(
+        KVDemand(full_tokens=8, window_tokens=window)
+    )

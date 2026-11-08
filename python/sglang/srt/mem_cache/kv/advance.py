@@ -55,6 +55,36 @@ def coalesce_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
     return merged
 
 
+def retired_part(start: int, end: int, dead_lo: int, dead_hi: int) -> Tuple[int, int]:
+    """The part ``[lo, hi)`` of row positions ``[start, end)`` that falls in a
+    window's retired rows ``[dead_lo, dead_hi)``; ``lo == hi`` when none does."""
+    lo = min(max(dead_lo, start), end)
+    hi = min(max(dead_hi, start), end)
+    return lo, hi
+
+
+def live_window_spans(
+    ranges: list[tuple[int, int]], dead_lo: int, dead_hi: int
+) -> list[tuple[int, int]]:
+    """The parts of ascending ``ranges`` a window still holds rows for: all but
+    its retired rows ``[dead_lo, dead_hi)``."""
+    spans = []
+    for start, end in ranges:
+        lo, hi = retired_part(start, end, dead_lo, dead_hi)
+        spans.extend(
+            (left, right) for left, right in ((start, lo), (hi, end)) if left < right
+        )
+    return spans
+
+
+def pages_spanned(spans: list[tuple[int, int]], page_size: int) -> int:
+    """Pages a free of page-disjoint ``spans`` releases: each frees every page it
+    touches, ``[start // page_size, ceil(end / page_size))`` (`free_segments`)."""
+    return sum(
+        -(-end // page_size) - start // page_size for start, end in spans if start < end
+    )
+
+
 def retire_window_rows(
     req: Req,
     pre_len: int,

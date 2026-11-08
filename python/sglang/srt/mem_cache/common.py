@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolTransfer
+from sglang.srt.mem_cache.kv.advance import retired_part
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
@@ -102,8 +103,7 @@ def free_kv_row_segments(
     swa_alive: list[tuple[torch.Tensor, int]] = []
     for kv_indices, start_pos in segments:
         end_pos = start_pos + kv_indices.numel()
-        lo = min(max(dead_lo, start_pos), end_pos)
-        hi = min(max(dead_hi, start_pos), end_pos)
+        lo, hi = retired_part(start_pos, end_pos, dead_lo, dead_hi)
         # start_pos <= lo <= hi <= end_pos
         # inside [lo, hi) is the swa dead segment
         if hi <= lo:
@@ -187,6 +187,7 @@ def match_kv_cache(
     token_ids: Optional[array] = None,
     *,
     cow_mamba: bool = False,
+    defer_cow_slot: bool = False,
     max_prefix_len: Optional[int] = None,
 ) -> MatchResult:
     """Match token_ids against tree_cache and adopt the hit as req's prefix."""
@@ -197,6 +198,7 @@ def match_kv_cache(
         MatchPrefixParams(
             key=_req_radix_key(tree_cache, req, token_ids, max_prefix_len),
             cow_mamba=cow_mamba,
+            defer_cow_slot=defer_cow_slot,
             req=req,
         )
     )
@@ -426,6 +428,53 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
     req.kv.mark_kv_released()
 
 
+def release_plan(req: Req, tree_cache: BasePrefixCache) -> dict[str, int]:
+    """Units by sub-pool (tokens, slots for state) that retracting ``req`` now,
+    `release_kv_cache` without a checkpoint, frees; it changes nothing. Its pages
+    are counted as the frees touch them, through the helpers the frees use. A row
+    its session keeps frees only the tail the session cuts. What the unlock leaves
+    evictable is not counted: whether a prefix entry frees depends on other
+    holders' locks."""
+    kv = req.kv
+    if not (kv.holds_kv or kv.holds_mamba):
+        return {}
+    storage = kv_storage_of(
+        tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
+    )
+    if not kv.holds_kv:
+        # Only the state slot taken before the row (`release_state_slot`).
+        return storage.state_slots_released(req, tracking=False)
+    kept_tail = tree_cache.kept_row_frees(req)
+    if kept_tail is not None:
+        # The session keeps the prefix and the state slots.
+        return storage.units_freed_by_free_row(kv, [kept_tail])
+    owned_kv_len = req.owned_kv_len()
+    freed = storage.state_slots_released(req)
+    for start, end in (
+        (kv.cache_protected_len, owned_kv_len),
+        _overallocated_range(
+            owned_kv_len, kv.kv_allocated_len, tree_cache.logical_page_size
+        ),
+    ):
+        for name, units in storage.units_freed_by_free_row(kv, [(start, end)]).items():
+            freed[name] = freed.get(name, 0) + units
+    return freed
+
+
+def _overallocated_range(
+    owned_kv_len: int, allocated_len: int, page_size: int
+) -> tuple[int, int]:
+    """The over-allocated tail of a released row: from the allocator page after
+    its own rows, so the two frees never share a page."""
+    # Align to the ALLOCATOR's page, which under DCP is wider than the kernel
+    # page: paged free() releases the whole page containing any freed index, so
+    # a boundary aligned only to the kernel page could free a widened page whose
+    # head rows are still live.
+    if page_size > 1:
+        owned_kv_len = ceil_align(owned_kv_len, page_size)
+    return owned_kv_len, allocated_len
+
+
 def _release_overallocated_kv_indices(
     req: Req, start_p: int, end_p: int, tree_cache: BasePrefixCache
 ) -> None:
@@ -445,13 +494,7 @@ def _release_overallocated_kv_indices(
             f"Unexpected overallocated KV cache, {req.kv.kv_committed_len=}, {req.kv.kv_allocated_len=}"
         )
 
-    # Align to the ALLOCATOR's page, which under DCP is wider than the kernel
-    # page: paged free() releases the whole page containing any freed index, so
-    # a boundary aligned only to the kernel page could free a widened page whose
-    # head rows are still live.
-    if page_size > 1:
-        start_p = ceil_align(start_p, page_size)
-
+    start_p, end_p = _overallocated_range(start_p, end_p, page_size)
     if start_p < end_p:
         # start_p is aligned to the allocator's page above, so it never shares a
         # page with the tail free_kv_row in this group.

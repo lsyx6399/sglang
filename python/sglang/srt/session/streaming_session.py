@@ -56,6 +56,11 @@ def _is_streaming(req: Optional[Req]) -> bool:
     return req is not None and req.session is not None and req.session.streaming
 
 
+def _finished_len(req: Req) -> int:
+    """The outputs a kept turn keeps: the next turn's input ends there."""
+    return req.finished_len if req.finished_len is not None else len(req.output_ids)
+
+
 class StreamingSession:
     """Streaming-session KV records, owned by ``UnifiedRadixCache``.
 
@@ -177,21 +182,17 @@ class StreamingSession:
         if not _is_streaming(req):
             return False
 
-        from sglang.srt.managers.req_types import FINISH_ABORT
-
         slot = self.borrowed_slot(req)
         assert slot is not None, f"streaming {req.rid=} does not run on its slot"
-        if isinstance(req.finished_reason, FINISH_ABORT):
-            # Hand the record and the tree lock back; the caller releases them.
+        if not self.keeps_row(req):
+            # Aborted: hand the record and the tree lock back; the caller releases them.
             del self.slots[req.session.session_id]
             req.lock, slot.lock = slot.lock, None
             req.release_mm_inputs_on_abort()
             req.session.abort_req()
             return False
 
-        finished_len = (
-            req.finished_len if req.finished_len is not None else len(req.output_ids)
-        )
+        finished_len = _finished_len(req)
         target = len(req.origin_input_ids) + finished_len
         self._trim_overshoot(req, finished_len)
 
@@ -208,6 +209,22 @@ class StreamingSession:
         req.session.finish_req(req)
 
         return True
+
+    def keeps_row(self, req: Req) -> bool:
+        """Whether releasing ``req`` now leaves its row, and the state slots its
+        record holds, to its session (`try_cache_finished_req`): a turn not aborted."""
+        from sglang.srt.managers.req_types import FINISH_ABORT
+
+        return _is_streaming(req) and not isinstance(req.finished_reason, FINISH_ABORT)
+
+    def kept_row_frees(self, req: Req) -> Optional[tuple[int, int]]:
+        """None unless releasing ``req`` now leaves its row to its session
+        (`keeps_row`); then the row positions that release still frees, the
+        tail `_trim_overshoot` cuts past the turn's end. Frees nothing."""
+        if not self.keeps_row(req):
+            return None
+        target = self._trim_target(req, _finished_len(req))
+        return self._aligned_free_range(target, req.kv.kv_allocated_len)
 
     def try_checkpoint(self, req: Req, *, up_to: int, **kwargs) -> bool:
         # A turn publishes nothing of its own, except the first prompt: the slot
@@ -305,21 +322,30 @@ class StreamingSession:
     def _trim_overshoot(self, req: Req, finished_len: int) -> None:
         """Spec v2 can commit past max_new_tokens; the next turn's input is
         output_ids[:finished_len], so release the KV past it."""
+        target = self._trim_target(req, finished_len)
+        self._free_kv_aligned(req.kv, target, req.kv.kv_allocated_len)
+        req.kv.truncate(target)
+        req.output_ids = req.output_ids[:finished_len]
+
+    def _trim_target(self, req: Req, finished_len: int) -> int:
+        """The row length `_trim_overshoot` cuts a kept turn to."""
         target = len(req.origin_input_ids) + finished_len
         if self.cache.page_size > 1 and req.kv.max_evicted_seqlen > target:
             # Same hazard as the match-path rewind: the cursor must stay
             # page-aligned; the partial page is re-prefilled next turn.
             target = (target // self.cache.page_size) * self.cache.page_size
-        self._free_kv_aligned(req.kv, target, req.kv.kv_allocated_len)
-        req.kv.truncate(target)
-        req.output_ids = req.output_ids[:finished_len]
+        return target
 
     def _free_kv_aligned(self, kv: ReqKvInfo, target: int, end: int) -> None:
-        """Free [ceil_align(target), end): paged free returns whole pages, so
-        the partial page stays until release_session."""
-        start = target
-        if self.cache.page_size > 1:
-            start = ceil_align(start, self.cache.page_size)
+        start, end = self._aligned_free_range(target, end)
         if end <= start:
             return
         self.cache.free_kv_row(kv, [(start, end)])
+
+    def _aligned_free_range(self, target: int, end: int) -> tuple[int, int]:
+        """[ceil_align(target), end): paged free returns whole pages, so the
+        partial page stays until release_session."""
+        start = target
+        if self.cache.page_size > 1:
+            start = ceil_align(start, self.cache.page_size)
+        return start, end

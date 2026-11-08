@@ -28,6 +28,8 @@ from sglang.srt.mem_cache.kv.advance import (
     TrackingAdvance,
     advance_tracking,
     coalesce_ranges,
+    live_window_spans,
+    pages_spanned,
     retire_window_rows,
 )
 from sglang.srt.mem_cache.kv.alloc.page_usage import Consumer
@@ -457,12 +459,13 @@ class KVStorage:
         retained document window) until `release_row`."""
         self.requests.hold(holder.kv.req_pool_idx)
 
-    def others_hold_rows(self, req: Optional[Req]) -> bool:
+    def others_hold_rows(self, req: Optional[Req], *, releasing: int = 0) -> bool:
         """Whether work other than ``req`` (None: no request) holds a request
         table row it gives back when it ends, so waiting for it can free memory;
-        a parked row does not count."""
+        a parked row does not count, nor ``releasing`` rows a preemption being
+        priced gives up."""
         table = self.requests
-        held = sum(table.count(state) for state in _COUNTED)
+        held = sum(table.count(state) for state in _COUNTED) - releasing
         own = (
             req is not None
             and req.kv.req_pool_idx is not None
@@ -510,10 +513,15 @@ class KVStorage:
             return self._allocator.full_attn_allocator
         return self._allocator
 
-    def available_units(self, sub_pool: str) -> int:
-        """Units ``take_units`` can hand out without eviction: the planner's
-        answer, which counts the room a relayout makes, as a take does."""
-        return self._allocator.units_available(sub_pool)
+    def units_fit(self, sub_pool: str, count: int) -> bool:
+        """Whether ``take_units`` can hand out ``count`` units (tokens, slots for
+        state) now, counting the room a relayout makes, as a take does."""
+        if count <= 0:
+            return True
+        allocator = self._allocator
+        if sub_pool != allocator.sub_pool_roles()[2]:
+            count = -(-count // allocator.page_size)
+        return allocator.units_fit({sub_pool: count})
 
     def take_units(self, sub_pool: str, count: int) -> Optional[torch.Tensor]:
         """``count`` rows of ``sub_pool`` alone (a load the tree stages); None
@@ -545,22 +553,54 @@ class KVStorage:
     def free_row(self, kv: ReqKvInfo, ranges: list[tuple[int, int]]) -> None:
         row = self.requests.req_to_token[kv.req_pool_idx]
         ranges = coalesce_ranges(ranges)
-        dead_lo = kv.window_dead_lo(self._allocator.page_size)
-        for sub_pool in self._sub_pools:
-            if sub_pool.name not in self._allocator.window_allocators:
-                continue
-            dead_hi = max(dead_lo, kv.get_evicted_seqlen(sub_pool.name))
-            for start, end in ranges:
-                lo = min(max(dead_lo, start), end)
-                hi = min(max(dead_hi, start), end)
-                for left, right in ((start, lo), (hi, end)):
-                    if left < right:
-                        self._allocator.free_window_segment(
-                            sub_pool.name, row[left:right], start_pos=left
-                        )
+        for name, spans in self._window_spans(kv, ranges).items():
+            for left, right in spans:
+                self._allocator.free_window_segment(
+                    name, row[left:right], start_pos=left
+                )
         self._allocator.free_full_segments(
             [(row[start:end], start) for start, end in ranges]
         )
+
+    def units_freed_by_free_row(
+        self, kv: ReqKvInfo, ranges: list[tuple[int, int]]
+    ) -> Dict[str, int]:
+        """Tokens, by sub-pool, that `free_row` of ``ranges`` gives back, without
+        freeing them: every page the frees touch, a partial last page included."""
+        ranges = coalesce_ranges(ranges)
+        page_size = self._allocator.page_size
+        owner = self._allocator.sub_pool_roles()[0]
+        freed = {owner: pages_spanned(ranges, page_size) * page_size}
+        for name, spans in self._window_spans(kv, ranges).items():
+            freed[name] = pages_spanned(spans, page_size) * page_size
+        return freed
+
+    def _window_spans(
+        self, kv: ReqKvInfo, ranges: list[tuple[int, int]]
+    ) -> Dict[str, list[tuple[int, int]]]:
+        """Each window's part of ``ranges``: the rows it has not retired."""
+        dead_lo = kv.window_dead_lo(self._allocator.page_size)
+        return {
+            name: live_window_spans(
+                ranges, dead_lo, max(dead_lo, kv.get_evicted_seqlen(name))
+            )
+            for name in self._allocator.window_allocators
+        }
+
+    def state_slots_released(
+        self, req: Req, *, tracking: bool = True
+    ) -> Dict[str, int]:
+        """State slots, by sub-pool, that giving back ``req``'s state frees: its
+        working slot and, with ``tracking`` (`release_state`), every tracking
+        slot it fills (`StateStorage.released_request_slots`)."""
+        state = self._allocator.state
+        if state is None or not req.kv.holds_mamba:
+            return {}
+        return {
+            self._allocator.sub_pool_roles()[2]: state.released_request_slots(
+                self.requests, req, tracking=tracking
+            )
+        }
 
     def window_ids(self, sub_pool: str, owner_ids: torch.Tensor) -> torch.Tensor:
         """The window's row ids of these owner token ids, as transfers and the

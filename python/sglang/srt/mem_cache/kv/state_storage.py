@@ -244,6 +244,24 @@ class StateStorage:
             req.kv.mamba_last_track_idx = None
             req.kv.mamba_prev_track_seqlen = None
 
+    def released_request_slots(self, table, req: Req, *, tracking: bool = True) -> int:
+        """Slots `release` (keeping none) gives back for a request holding state:
+        its working slot and, with ``tracking``, every tracking slot it fills,
+        a lazily taken second one included."""
+        count = 1
+        if tracking and table.enable_mamba_extra_buffer:
+            count += len(self._released_tracking_positions(table, req, None))
+        return count
+
+    @staticmethod
+    def _released_tracking_positions(table, req: Req, keep: Optional[int]) -> List[int]:
+        empty = req.kv.mamba_ping_pong_empty
+        return [
+            p
+            for p in range(table.mamba_ping_pong_track_buffer_size)
+            if p != keep and not empty[p]
+        ]
+
     def release(
         self,
         table,
@@ -263,8 +281,7 @@ class StateStorage:
             assert keep in (None, 0, 1) and (keep != 1 or size == 2), (
                 f"cannot keep ping-pong entry {keep} of {size}"
             )
-            empty = req.kv.mamba_ping_pong_empty
-            positions = [p for p in range(size) if p != keep and not empty[p]]
+            positions = self._released_tracking_positions(table, req, keep)
             row = table.req_index_to_mamba_ping_pong_track_buffer_mapping[
                 req.kv.req_pool_idx
             ]

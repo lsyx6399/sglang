@@ -2,7 +2,7 @@ import unittest
 from array import array
 from functools import partial
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, patch
 
 import torch
 
@@ -27,10 +27,18 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
 )
 from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
+from sglang.srt.mem_cache.allocation import alloc_req_slots
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.kits.unified_radix_cache.config import CacheConfig
+from sglang.test.kits.unified_radix_cache.fixtures import build_fixture
 from sglang.test.scheduler_test_utils import empty_request_lists
+from sglang.test.unified_allocator_fixtures import build_tri_cache
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -112,6 +120,66 @@ def _scheduler():
     s.enable_fpm = False
     s._maybe_clear_mm_inputs = Mock()
     s.maybe_send_health_check_signal = Mock()
+    return s
+
+
+class _PreemptingAdder(PrefillAdder):
+    """An adder whose test subclass decides preemption and admission."""
+
+    def __init__(self, page_size, tree_cache, allocator, batch, *_, **__):
+        self.running_batch = batch
+        self.can_run_list = []
+        self.preempt_list = []
+        self.new_chunked_req = None
+
+    def budget_state(self):
+        return AddReqResult.CONTINUE
+
+
+def _preempting_scheduler(
+    adder_class,
+    running_batch,
+    waiting,
+    *,
+    tree_cache,
+    token_to_kv_pool_allocator,
+    req_to_token_pool,
+):
+    """A scheduler whose next prefill pass finds the running batch full, with
+    priority preemption on, and ``waiting`` queued."""
+    s = _scheduler()
+    s.running_reqs.join(running_batch.reqs)
+    s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
+    s.enable_priority_preemption = True
+    s.is_hybrid_swa = False
+    s.waiting_queue.join([waiting])
+    s.min_free_slots_delayer = None
+    s.get_num_allocatable_reqs = lambda *args, **kwargs: 0
+    s.policy = Mock(calc_priority=lambda waiting, *args, **kwargs: list(waiting))
+    s.disagg_prefill_bootstrap_queue = None
+    s.chunked_prefill_size = 8192
+    s.dynamic_chunk_sizer = None
+    s.tp_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(attn_backend=SimpleNamespace())
+    )
+    s.get_prefill_adder_class = lambda: adder_class
+    s.request_retirer = None
+    s.page_size = 1
+    s.tree_cache = tree_cache
+    s.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+    s.req_to_token_pool = req_to_token_pool
+    s.new_token_ratio_tracker = SimpleNamespace(current=0.0)
+    s.max_prefill_tokens = 1 << 20
+    s.is_mixed_chunk = False
+    s.priority_scheduling_preemption_threshold = 0
+    s.max_prefill_bs = 0
+    s.max_running_requests = 4
+    s.enable_lora = False
+    s.enable_hicache_storage = False
+    s.enable_unified_cache_external_linker = False
+    s.enable_lmcache = False
+    s.truncation_align_size = None
+    s._add_request_to_queue = Mock()
     return s
 
 
@@ -350,66 +418,42 @@ class TestRunningReqsHooks(CustomTestCase):
         )
 
     def test_preemption_leaves_even_when_nothing_is_admitted(self):
-        s = _scheduler()
+        """Also a regression: preemption prices the request on the prefix match
+        refreshed for this pass, as admission does; priced before it, it read the
+        previous pass's prefix and host hits."""
         victim, other = _req("v"), _req("o")
         running_batch = ScheduleBatch(reqs=[victim, other])
-        s.running_reqs.join(running_batch.reqs)
+        calls = []
         waiting = SimpleNamespace(
             beam_group=None,
-            init_next_round_input=Mock(),
+            init_next_round_input=Mock(
+                side_effect=lambda *_, **__: calls.append("match")
+            ),
             kv=SimpleNamespace(holds_mamba=False),
         )
 
-        class _Adder(PrefillAdder):
-            def __init__(self, page_size, tree_cache, allocator, batch, *_, **__):
-                self.running_batch = batch
-                self.can_run_list = []
-                self.preempt_list = []
-
-            def budget_state(self):
-                return AddReqResult.CONTINUE
-
-            def preempt_to_schedule(self, req):
+        class _Adder(_PreemptingAdder):
+            def preempt_to_schedule(self, req, **_):
+                calls.append("preempt")
                 self.preempt_list.append(self.running_batch.reqs.pop(0))
                 return True
 
             def add_one_req(self, req, **_):
                 return AddReqResult.NO_TOKEN
 
-        s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
-        s.enable_priority_preemption = True
-        s.is_hybrid_swa = False
-        s.waiting_queue.join([waiting])
-        s.min_free_slots_delayer = None
-        s.get_num_allocatable_reqs = lambda *args, **kwargs: 0
-        s.policy = Mock(calc_priority=lambda waiting, *args, **kwargs: list(waiting))
-        s.disagg_prefill_bootstrap_queue = None
-        s.chunked_prefill_size = 8192
-        s.dynamic_chunk_sizer = None
-        s.tp_worker = SimpleNamespace(
-            model_runner=SimpleNamespace(attn_backend=SimpleNamespace())
+        s = _preempting_scheduler(
+            _Adder,
+            running_batch,
+            waiting,
+            tree_cache=SimpleNamespace(buffer_pipeline=None),
+            token_to_kv_pool_allocator=SimpleNamespace(state_slots=None),
+            req_to_token_pool=None,
         )
-        s.get_prefill_adder_class = lambda: _Adder
-        s.request_retirer = None
-        s.page_size = 1
-        s.tree_cache = SimpleNamespace(buffer_pipeline=None)
-        s.token_to_kv_pool_allocator = SimpleNamespace(state_slots=None)
-        s.new_token_ratio_tracker = SimpleNamespace(current=0.0)
-        s.max_prefill_tokens = 1 << 20
-        s.is_mixed_chunk = False
-        s.priority_scheduling_preemption_threshold = 0
-        s.max_prefill_bs = 0
-        s.max_running_requests = 4
-        s.enable_lora = False
-        s.enable_hicache_storage = False
-        s.enable_unified_cache_external_linker = False
-        s.enable_lmcache = False
-        s.truncation_align_size = None
-        s._add_request_to_queue = Mock()
 
         new_batch, _ = s._get_new_batch_prefill_raw(None, running_batch)
 
         self.assertIsNone(new_batch)
+        self.assertEqual(calls, ["match", "preempt"])
         s._add_request_to_queue.assert_called_once_with(victim)
         self.assertEqual(list(s.running_reqs), [other])
 
@@ -431,6 +475,130 @@ class TestRunningReqsHooks(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, r"launched with \[\]"):
                 never_launched = _batch([_req("c")], ForwardMode.DECODE)
                 s.process_batch_result(never_launched, MagicMock())
+
+
+class _Admitted(Exception):
+    pass
+
+
+class TestPreemptionMatchTakesNoStateSlot(CustomTestCase):
+    """Regression: a request preemption makes room for, whose prefix hit has a
+    cached state on the device, was matched before preemption with its copy of
+    that state taking a slot; with every slot held, a victim's included, the
+    match asserted instead of preempting. Static and unified pools alike."""
+
+    def setUp(self):
+        super().setUp()
+        enter_scope(self, published_topology())
+
+    @staticmethod
+    def _pools(pool):
+        if pool == "static":
+            cache, allocator, req_to_token_pool = build_fixture(
+                CacheConfig(components=(ComponentType.FULL, ComponentType.MAMBA))
+            )
+            return cache, allocator, req_to_token_pool
+        bundle, allocator, cache = build_tri_cache()
+        return cache, allocator, bundle.req_to_token_pool
+
+    def _pass(self, pool, *, victim_eligible, leave_free=0):
+        cache, allocator, req_to_token_pool = self._pools(pool)
+        slots = allocator.state_slots
+        prefix = list(range(1, 9))
+        checkpoint = slots.alloc(1)
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", prefix)),
+                value=allocator.alloc(len(prefix)),
+                mamba_value=checkpoint,
+            )
+        )
+        running = _req("running")
+        running.kv.mamba_pool_idx = slots.alloc(1)[0]
+        taken = []
+        while (slot := slots.alloc(1)) is not None:
+            taken.append(slot)
+        for slot in taken[:leave_free]:
+            slots.free(slot)
+        free_before = slots.available_size()
+        req = Req("new", "", array("q", prefix + [100, 101]), SamplingParams())
+        storage = kv_storage_of(req_to_token_pool, allocator)
+        priced = []
+        self.slot_fit_when_priced = []
+        slot_fit_when_priced = self.slot_fit_when_priced
+
+        class _Adder(_PreemptingAdder):
+            def preempt_to_schedule(self, req, **_):
+                priced.append((req.prefix_len, req.kv.holds_mamba))
+                slot_fit_when_priced.append(slots.slots_fit(1))
+                if not victim_eligible:
+                    return False
+                victim = self.running_batch.reqs.pop(0)
+                storage.release_state_slot(victim)
+                self.preempt_list.append(victim)
+                return True
+
+            def add_one_req(self, req, **_):
+                self.can_run_list.append(req)
+                return AddReqResult.CONTINUE
+
+        running_batch = ScheduleBatch(reqs=[running])
+        s = _preempting_scheduler(
+            _Adder,
+            running_batch,
+            req,
+            tree_cache=cache,
+            token_to_kv_pool_allocator=allocator,
+            req_to_token_pool=req_to_token_pool,
+        )
+        s.model_config = s.enable_overlap = s.spec_algorithm = None
+        with patch.object(ScheduleBatch, "init_new", side_effect=_Admitted) as built:
+            try:
+                new_batch, _ = s._get_new_batch_prefill_raw(None, running_batch)
+            except _Admitted:
+                new_batch = built.call_args.args[0]
+        # Priced on the fresh match, holding no state slot of its own.
+        self.assertEqual(priced, [(len(prefix), False)])
+        return req, new_batch, storage, allocator, cache, checkpoint, free_before
+
+    def test_an_eligible_victim_is_preempted_then_the_request_admitted(self):
+        for pool in ("static", "unified"):
+            with self.subTest(pool=pool):
+                req, admitted, storage, allocator, cache, checkpoint, _ = self._pass(
+                    pool, victim_eligible=True
+                )
+                self.assertEqual(admitted, [req])
+                self.assertFalse(req.kv.holds_mamba)
+                self.assertEqual(
+                    req.kv.mamba_cow_src_index.tolist(), checkpoint.tolist()
+                )
+                # The row binding takes the slot the victim gave back, and the
+                # copy from the cached state still runs into it.
+                alloc_req_slots(storage, allocator.state, [req], cache)
+                self.assertTrue(req.kv.holds_mamba)
+                self.assertEqual(
+                    req.kv.mamba_cow_src_index.tolist(), checkpoint.tolist()
+                )
+
+    def test_without_a_victim_the_request_stays_queued_holding_no_slot(self):
+        for pool in ("static", "unified"):
+            with self.subTest(pool=pool):
+                req, new_batch, _, allocator, _, _, free_before = self._pass(
+                    pool, victim_eligible=False
+                )
+                self.assertIsNone(new_batch)
+                self.assertFalse(req.kv.holds_mamba)
+                self.assertIsNone(req.kv.mamba_cow_src_index)
+                self.assertEqual(allocator.state_slots.available_size(), free_before)
+
+    def test_the_price_sees_a_free_slot_as_free(self):
+        """Regression: the pass pre-took a free slot for its group of matches, so
+        the deferred match, which takes none, was priced as if no slot were
+        free and the request needed a victim it did not."""
+        for pool in ("static", "unified"):
+            with self.subTest(pool=pool):
+                self._pass(pool, victim_eligible=False, leave_free=1)
+                self.assertEqual(self.slot_fit_when_priced, [True])
 
 
 if __name__ == "__main__":
