@@ -494,6 +494,7 @@ class AscendKDAHybridLinearAttnBackend:
                 mamba_steps_to_track,
                 model,
                 req_pool_indices=None,
+                state_slots=None,
             ):
                 from sgl_kernel_npu.mamba.mamba_state_update_triton import (
                     conv_state_rollback,
@@ -506,11 +507,9 @@ class AscendKDAHybridLinearAttnBackend:
                 del req_pool_indices
                 request_number = last_correct_step_indices.shape[0]
 
-                state_indices_tensor = (
-                    self.linear_attn_backend.forward_metadata.mamba_cache_indices[
-                        :request_number
-                    ]
-                )
+                if state_slots is None:
+                    state_slots = self.forward_state_slots(request_number, None)
+                state_indices_tensor = state_slots.working[:request_number]
 
                 mamba_caches = self.linear_attn_backend.state_pool.get_speculative_mamba2_params_all_layers()
 
